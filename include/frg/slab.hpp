@@ -292,6 +292,23 @@ private:
 
 	slab_frame *_construct_slab(int index);
 
+	bool reallocate_in_slab_(slab_frame *slb, void *p, size_t new_size) {
+		size_t item_size = bucket_to_size(slb->index);
+		FRG_ASSERT(slb->contains(p));
+		FRG_ASSERT(!enable_checking
+				|| !((reinterpret_cast<uintptr_t>(p) - slb->address) % item_size));
+
+		if(new_size > item_size)
+			return false;
+
+		if constexpr (has_poisoning) {
+			_plcy.unpoison_expand(p, item_size);
+			_plcy.poison(p, item_size);
+			_plcy.unpoison(p, new_size);
+		}
+		return true;
+	}
+
 	void free_in_slab_(slab_frame *slb, void *p) {
 		size_t item_size = bucket_to_size(slb->index);
 		FRG_ASSERT(slb->contains(p));
@@ -328,6 +345,20 @@ private:
 	//--------------------------------------------------------------------------------------
 
 	frame *_construct_large(size_t area_size);
+
+	bool reallocate_huge_(frame *sup, void *p, size_t new_size) {
+		FRG_ASSERT(sup->address == reinterpret_cast<uintptr_t>(p));
+
+		if(new_size > sup->length)
+			return false;
+
+		if constexpr (has_poisoning) {
+			_plcy.unpoison_expand(p, sup->length);
+			_plcy.poison(p, sup->length);
+			_plcy.unpoison(p, new_size);
+		}
+		return true;
+	}
 
 	void free_huge_(frame *sup, void *p) {
 		FRG_ASSERT(sup->address == reinterpret_cast<uintptr_t>(p));
@@ -470,59 +501,37 @@ void *slab_pool<Policy, Mutex>::allocate(size_t length) {
 }
 
 template<typename Policy, typename Mutex>
-void *slab_pool<Policy, Mutex>::realloc(void *pointer, size_t new_length) {
+void *slab_pool<Policy, Mutex>::realloc(void *p, size_t new_size) {
 	if(enable_checking)
 		_verify_integrity();
 
-	if(!pointer) {
-		return allocate(new_length);
-	}else if(!new_length) {
-		free(pointer);
+	// Handle special cases first.
+	if(!p) {
+		return allocate(new_size);
+	}else if(!new_size) {
+		free(p);
 		return nullptr;
 	}
-	auto address = reinterpret_cast<uintptr_t>(pointer);
 
-	unique_lock<Mutex> tree_guard(_tree_mutex);
-	auto fra = _find_frame(address);
-	tree_guard.unlock();
-	if(!fra)
-		FRG_ASSERT(!"Pointer is not part of any virtual area");
-
-	if(fra->type == frame_type::slab) {
-		auto slb = static_cast<slab_frame *>(fra);
-		size_t item_size = bucket_to_size(slb->index);
-
-		if(new_length <= item_size) {
-			if constexpr (has_poisoning) {
-				_plcy.unpoison_expand(pointer, item_size);
-				_plcy.poison(pointer, item_size);
-				_plcy.unpoison(pointer, new_length);
-			}
-			return pointer;
-		}
-
-		void *new_pointer = allocate(new_length);
-		if(!new_pointer)
-			return nullptr;
-		memcpy(new_pointer, pointer, item_size);
-		free(pointer);
-		//infoLogger() << "[slab] realloc " << new_pointer << frg::endLog;
-		return new_pointer;
+	auto address = reinterpret_cast<uintptr_t>(p);
+	auto sup = reinterpret_cast<frame *>((address - 1) & ~(sb_size - 1));
+	if(sup->type == frame_type::slab) {
+		auto slb = static_cast<slab_frame *>(sup);
+		if(reallocate_in_slab_(slb, p, new_size))
+			return p;
 	}else{
-		FRG_ASSERT(fra->type == frame_type::large);
-		FRG_ASSERT(address == fra->address);
-
-		if(new_length < fra->length)
-			return pointer;
-
-		void *new_pointer = allocate(new_length);
-		if(!new_pointer)
-			return nullptr;
-		memcpy(new_pointer, pointer, fra->length);
-		free(pointer);
-		//infoLogger() << "[slab] realloc " << new_pointer << frg::endLog;
-		return new_pointer;
+		FRG_ASSERT(sup->type == frame_type::large);
+		if(reallocate_huge_(sup, p, new_size))
+			return p;
 	}
+
+	// Fallback path that copies the memory region.
+	void *new_p = allocate(new_size);
+	if(!new_p)
+		return nullptr;
+	memcpy(new_p, p, sup->length);
+	free(p);
+	return new_p;
 }
 
 template<typename Policy, typename Mutex>
