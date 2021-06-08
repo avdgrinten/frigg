@@ -235,7 +235,9 @@ private:
 
 		const uintptr_t address;
 		const size_t length;
+#ifdef FRG_SLAB_TRACK_REGIONS
 		rbtree_hook frame_hook;
+#endif
 	};
 	static_assert(sizeof(frame) <= huge_padding, "Padding too small");
 
@@ -260,11 +262,13 @@ private:
 		}
 	};
 
+#ifdef FRG_SLAB_TRACK_REGIONS
 	using frame_tree_type = frg::rbtree<
 		frame,
 		&frame::frame_hook,
 		frame_less
 	>;
+#endif // FRG_SLAB_TRACK_REGIONS
 
 	using partial_tree_type = frg::rbtree<
 		slab_frame,
@@ -284,8 +288,6 @@ private:
 	};
 
 private:
-	frame *_find_frame(uintptr_t address);
-
 	//--------------------------------------------------------------------------------------
 	// Slab handling.
 	//--------------------------------------------------------------------------------------
@@ -367,7 +369,9 @@ private:
 		{
 			unique_lock<Mutex> tree_guard(_tree_mutex);
 
+#ifdef FRG_SLAB_TRACK_REGIONS
 			_frame_tree.remove(sup);
+#endif
 			_usedPages -= (sup->length + huge_padding) / page_size;
 		}
 
@@ -393,7 +397,9 @@ private:
 	Policy &_plcy;
 
 	Mutex _tree_mutex;
+#ifdef FRG_SLAB_TRACK_REGIONS
 	frame_tree_type _frame_tree;
+#endif
 	size_t _usedPages;
 	bucket _bkts[num_buckets];
 };
@@ -455,7 +461,9 @@ void *slab_pool<Policy, Mutex>::allocate(size_t length) {
 			slb->num_reserved++;
 
 			unique_lock<Mutex> tree_guard(_tree_mutex);
+#ifdef FRG_SLAB_TRACK_REGIONS
 			_frame_tree.insert(slb);
+#endif
 			_usedPages += (slb->length + huge_padding) / page_size;
 			tree_guard.unlock();
 
@@ -486,7 +494,9 @@ void *slab_pool<Policy, Mutex>::allocate(size_t length) {
 		auto fra = _construct_large(area_size);
 
 		unique_lock<Mutex> tree_guard(_tree_mutex);
+#ifdef FRG_SLAB_TRACK_REGIONS
 		_frame_tree.insert(fra);
+#endif
 		_usedPages += (fra->length + huge_padding) / page_size;
 		tree_guard.unlock();
 
@@ -592,25 +602,6 @@ void slab_pool<Policy, Mutex>::deallocate(void *p, size_t size) {
 
 
 template<typename Policy, typename Mutex>
-auto slab_pool<Policy, Mutex>::_find_frame(uintptr_t address)
--> frame * {
-	auto current = _frame_tree.get_root();
-	while(current) {
-		if(address < current->address) {
-			current = frame_tree_type::get_left(current);
-		}else if(address >= current->address + current->length) {
-			current = frame_tree_type::get_right(current);
-		}else{
-			FRG_ASSERT(address >= current->address
-					&& address < current->address + current->length);
-			return current;
-		}
-	}
-
-	return nullptr;
-}
-
-template<typename Policy, typename Mutex>
 auto slab_pool<Policy, Mutex>::_construct_slab(int index)
 -> slab_frame * {
 //	frg::infoLogger() << "Allocate new area for " << (void *)area_size << frg::endLog;
@@ -697,9 +688,11 @@ auto slab_pool<Policy, Mutex>::_construct_large(size_t area_size)
 
 template<typename Policy, typename Mutex>
 void slab_pool<Policy, Mutex>::_verify_integrity() {
+#ifdef FRG_SLAB_TRACK_REGIONS
 	unique_lock<Mutex> tree_guard(_tree_mutex);
 	if(_frame_tree.get_root())
 		_verify_frame_integrity(_frame_tree.get_root());
+#endif
 }
 
 template<typename Policy, typename Mutex>
@@ -716,10 +709,12 @@ void slab_pool<Policy, Mutex>::_verify_frame_integrity(frame *fra) {
 		}
 	}
 
+#ifdef FRG_SLAB_TRACK_REGIONS
 	if(_frame_tree.get_left(fra))
 		_verify_frame_integrity(frame_tree_type::get_left(fra));
 	if(_frame_tree.get_right(fra))
 		_verify_frame_integrity(frame_tree_type::get_right(fra));
+#endif
 }
 
 template<typename Policy, typename Mutex>
