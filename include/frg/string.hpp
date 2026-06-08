@@ -80,6 +80,26 @@ public:
 		return size_t(-1);
 	}
 
+	constexpr size_t find_first(basic_string_view other, size_t start_from = 0) const {
+		if(start_from > _length || (_length - start_from) < other._length)
+			return size_t(-1);
+
+		for(size_t i = start_from; i <= _length - other._length; ++i) {
+			bool found = true;
+			for(size_t j = 0; j < other._length; ++j) {
+				if(_pointer[i + j] != other._pointer[j]) {
+					found = false;
+					break;
+				}
+			}
+
+			if(found)
+				return i;
+		}
+
+		return size_t(-1);
+	}
+
 	constexpr size_t find_first_of(basic_string_view chars, size_t start_from = 0) const {
 		for(size_t i = start_from; i < _length; ++i) {
 			for(size_t j = 0; j < chars.size(); ++j)

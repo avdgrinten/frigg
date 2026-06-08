@@ -84,6 +84,9 @@ TEST(string_view, find) {
 
 	EXPECT_EQ(s1.find_first('B'), 1);
 	EXPECT_EQ(s1.find_first('D'), -1);
+	EXPECT_EQ(s1.find_first("ABC"), 0);
+	EXPECT_EQ(s1.find_first("BC"), 1);
+	EXPECT_EQ(s1.find_first("ABCD"), -1);
 	EXPECT_EQ(s1.find_first_of("CB"), 1);
 	EXPECT_EQ(s1.find_first_of("DE"), -1);
 }
