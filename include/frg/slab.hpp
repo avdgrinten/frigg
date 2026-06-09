@@ -151,6 +151,19 @@ struct slab_policy_traits {
 		return tc - 1 + ip + is;
 	}
 
+	// Documentation only: aligning a size to 2^a implies that the resulting bucket is also aligned to 2^a.
+	static constexpr bool aligned_size_implies_aligned_bucket() {
+		// Proof: Let M be the padded size.
+		// Let e be such that 2^e <= M < 2^(e+1). Note that a <= e (otherwise M >= 2^(e+1) since M is a multiple of 2^a).
+		// By construction, the size classes between 2^e and 2^(e+1) are 2^e + L * 2^g(e) with some function g.
+		// If a <= g(e), we are done since then 2^a divides both 2^e and 2^g(e).
+		// Hence, consider the case where a > g(e).
+		// Since M is aligned to 2^a, we can write M as M = 2^e + k * 2^a.
+		// Since a > g(e), 2^g(e) divides 2^a. But in this case, L = k * 2^a / 2^g(e) is an integer
+		// and thus M is a size class itself.
+		return true;
+	}
+
 	// This variable controls the number of buckets that we actually use.
 	static constexpr int num_buckets = [](){
 		if constexpr (is_detected_v<policy_num_buckets_t, Policy>)
