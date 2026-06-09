@@ -25,12 +25,16 @@ enum class error {
 //       in particular:
 //       * Slab size and page size overrides
 //       * Bucket customizations
-//       * Aligned page mapping functions
 template<typename P>
 concept Policy = requires(P policy, void *p, size_t size) {
 	// The map() and unmap() functions can be used to allocate and free memory at page granularity.
 	{ policy.map(size) } -> std::same_as<void *>;
 	{ policy.unmap(p, size) } -> std::same_as<void>;
+};
+
+template<typename P>
+concept aligned_map_policy = Policy<P> && requires(P policy, void *p, size_t size, size_t align) {
+	{ policy.map(size, align) } -> std::same_as<void *>;
 };
 
 // Thread-aware slab allocator.
@@ -247,19 +251,39 @@ private:
 		return reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(chunk) + ca);
 	}
 
+	struct aligned_mapping {
+		void *extent_ptr;
+		size_t extent_size;
+		uintptr_t address;
+	};
+
+	// Map a region that contains an address aligned to the given alignment.
+	frg::expected<error, aligned_mapping> map_aligned(size_t size, size_t alignment) {
+		if constexpr (aligned_map_policy<P>) {
+			size_t extent_size = (size + page_size - 1) & ~(page_size - 1);
+			void *extent_ptr = policy_.map(extent_size, alignment);
+			if (!extent_ptr)
+				return error::allocation_failed;
+			return aligned_mapping{extent_ptr, extent_size, reinterpret_cast<uintptr_t>(extent_ptr)};
+		} else {
+			// There is no aligned map() function, so we need to overallocate.
+			size_t extent_size = (size + alignment - 1 + page_size - 1) & ~(page_size - 1);
+			void *extent_ptr = policy_.map(extent_size);
+			if (!extent_ptr)
+				return error::allocation_failed;
+			return aligned_mapping{
+				extent_ptr,
+				extent_size,
+				(reinterpret_cast<uintptr_t>(extent_ptr) + alignment - 1) & ~(alignment - 1)
+			};
+		}
+	}
+
 	frg::expected<error> slab_chunk_create(bucket *bkt) {
 		FRG_ASSERT(!bkt->head_chunk);
 
-		// Over-allocate to ensure we can align to chunk_boundary.
-		auto extent_size = (chunk_size + chunk_boundary - 1 + page_size - 1) & ~(page_size - 1);
-		auto extent_ptr = policy_.map(extent_size);
-		if (!extent_ptr)
-			return error::allocation_failed;
-
-		// Align up to chunk_boundary.
-		auto raw_addr = reinterpret_cast<uintptr_t>(extent_ptr);
-		auto aligned_addr = (raw_addr + chunk_boundary - 1) & ~(chunk_boundary - 1);
-		auto chunk = reinterpret_cast<chunk_header *>(aligned_addr);
+		auto mapping = FRG_TRY(map_aligned(chunk_size, chunk_boundary));
+		auto chunk = reinterpret_cast<chunk_header *>(mapping.address);
 
 		if constexpr (slab::has_poisoning_support<P>)
 			policy_.unpoison(chunk, sizeof(chunk_header));
@@ -275,8 +299,8 @@ private:
 					.inactive{false},
 				}
 			},
-			.extent_ptr{extent_ptr},
-			.extent_size{extent_size},
+			.extent_ptr{mapping.extent_ptr},
+			.extent_size{mapping.extent_size},
 		};
 
 		// Build free list of all objects in the chunk.
@@ -517,32 +541,23 @@ private:
 		// Object starts after chunk_header, aligned to page boundary for large objects.
 		size_t object_alignment = 4096;
 		size_t first_offset = (sizeof(chunk_header) + object_alignment - 1) & ~(object_alignment - 1);
-		size_t data_size = first_offset + size;
 
-		// Over-allocate to ensure we can align to chunk_boundary.
-		auto extent_size = (data_size + chunk_boundary - 1 + page_size - 1) & ~(page_size - 1);
-		auto extent_ptr = policy_.map(extent_size);
-		if (!extent_ptr)
-			return error::allocation_failed;
-
-		// Align up to chunk_boundary.
-		auto raw_addr = reinterpret_cast<uintptr_t>(extent_ptr);
-		auto aligned_addr = (raw_addr + chunk_boundary - 1) & ~(chunk_boundary - 1);
-		auto chunk = reinterpret_cast<chunk_header *>(aligned_addr);
+		auto mapping = FRG_TRY(map_aligned(first_offset + size, chunk_boundary));
+		auto chunk = reinterpret_cast<chunk_header *>(mapping.address);
 
 		if constexpr (slab::has_poisoning_support<P>) {
 			policy_.unpoison(chunk, sizeof(chunk_header));
-			policy_.unpoison(reinterpret_cast<void *>(aligned_addr + first_offset), size);
+			policy_.unpoison(reinterpret_cast<void *>(mapping.address + first_offset), size);
 		}
 
 		new (chunk) chunk_header{
 			.type{chunk_type::large},
 			.owner{this},
-			.extent_ptr{extent_ptr},
-			.extent_size{extent_size},
+			.extent_ptr{mapping.extent_ptr},
+			.extent_size{mapping.extent_size},
 		};
 
-		return reinterpret_cast<void *>(aligned_addr + first_offset);
+		return reinterpret_cast<void *>(mapping.address + first_offset);
 	}
 
 	void large_free(chunk_header *chunk) {
