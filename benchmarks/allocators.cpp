@@ -1,5 +1,6 @@
 #include <atomic>
 #include <barrier>
+#include <cstdlib>
 #include <mutex>
 #include <sys/mman.h>
 #include <thread>
@@ -9,6 +10,7 @@
 #include <frg/random.hpp>
 #include <frg/sharded_slab.hpp>
 #include <frg/slab.hpp>
+#include <frg/spinlock.hpp>
 #include <mimalloc.h>
 
 // Helper data structures.
@@ -75,16 +77,39 @@ struct sharded_slab_policy {
 		return ptr;
 	}
 
+	void *map(size_t size, size_t alignment) {
+		size_t over = size + alignment;
+		void *raw = mmap(nullptr, over, PROT_READ | PROT_WRITE,
+		                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (raw == MAP_FAILED)
+			return nullptr;
+		auto base = reinterpret_cast<uintptr_t>(raw);
+		auto aligned = (base + alignment - 1) & ~(alignment - 1);
+		if (aligned > base)
+			munmap(reinterpret_cast<void *>(base), aligned - base);
+		if (aligned + size < base + over)
+			munmap(reinterpret_cast<void *>(aligned + size), (base + over) - (aligned + size));
+		return reinterpret_cast<void *>(aligned);
+	}
+
 	void unmap(void *ptr, size_t size) {
 		munmap(ptr, size);
 	}
+
+	static constexpr bool support_overaligned = true;
+	using mutex_type = frg::simple_spinlock;
 };
 
 struct sharded_slab_instance {
-	frg::sharded_slab::pool<sharded_slab_policy> pool;
+	frg::sharded_slab::domain<sharded_slab_policy> domain;
+	frg::sharded_slab::pool<sharded_slab_policy> pool{&domain};
 
 	void *allocate(size_t size) {
 		return pool.allocate(size);
+	}
+
+	void *allocate(size_t size, size_t alignment) {
+		return pool.allocate(size, alignment);
 	}
 
 	void deallocate(void *ptr) {
@@ -99,6 +124,10 @@ struct system_instance {
 		return std::malloc(size);
 	}
 
+	void *allocate(size_t size, size_t alignment) {
+		return std::aligned_alloc(alignment, size);
+	}
+
 	void deallocate(void *ptr) {
 		std::free(ptr);
 	}
@@ -109,6 +138,10 @@ struct system_instance {
 struct mimalloc_instance {
 	void *allocate(size_t size) {
 		return mi_malloc(size);
+	}
+
+	void *allocate(size_t size, size_t alignment) {
+		return mi_malloc_aligned(size, alignment);
 	}
 
 	void deallocate(void *ptr) {
@@ -210,3 +243,38 @@ BENCHMARK(BM_Allocators_MsgPass<mimalloc_instance>)
     ->Arg(1)->Arg(2)->Arg(4)->Arg(8)
     ->Unit(benchmark::kMillisecond)
     ->MeasureProcessCPUTime();
+
+// Round-trip latency of an over-aligned allocation with alignment == size.
+// Pages are never touched, so this measures the allocation path, not faulting in memory.
+template <typename Instance>
+static void BM_Overaligned(benchmark::State &state) {
+	size_t alignment = size_t{1} << state.range(0);
+
+	Instance instance;
+	for (auto _ : state) {
+		void *ptr = instance.allocate(alignment, alignment);
+		if (!ptr) {
+			state.SkipWithError("over-aligned allocation failed");
+			break;
+		}
+		benchmark::DoNotOptimize(ptr);
+		instance.deallocate(ptr);
+	}
+
+	state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_Overaligned<sharded_slab_instance>)
+    ->Arg(21)  // 2 MiB
+    ->Arg(30)  // 1 GiB
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_Overaligned<system_instance>)
+    ->Arg(21)  // 2 MiB
+    ->Arg(30)  // 1 GiB
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK(BM_Overaligned<mimalloc_instance>)
+    ->Arg(21)  // 2 MiB
+    ->Arg(30)  // 1 GiB
+    ->Unit(benchmark::kMicrosecond);
