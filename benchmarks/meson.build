@@ -1,5 +1,6 @@
 benchmark_dep = dependency('benchmark_main', required: true)
-mimalloc_dep = dependency('mimalloc', required: true)
+# Set override=false such that mimalloc does not override the system allocator.
+mimalloc_dep = dependency('mimalloc', required: true, default_options: ['override=false'])
 
 benchmark_executable = executable('frigg_benchmarks',
 	'allocators.cpp',
