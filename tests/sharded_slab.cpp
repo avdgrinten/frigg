@@ -4,9 +4,11 @@
 #include <vector>
 
 #include <frg/sharded_slab.hpp>
+#include <frg/spinlock.hpp>
 #include <gtest/gtest.h>
 
-struct sharded_slab_policy {
+// Plain mapping policy without over-alignment support.
+struct sharded_slab_base_policy {
 	void *map(size_t size) {
 		void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
 		               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -20,11 +22,45 @@ struct sharded_slab_policy {
 	}
 };
 
+// The policy used by most tests: opts into over-aligned allocations with an aligned map().
+struct sharded_slab_policy : sharded_slab_base_policy {
+	static constexpr bool support_overaligned = true;
+	using mutex_type = frg::simple_spinlock;
+
+	using sharded_slab_base_policy::map;
+
+	// Over-map by the alignment and trim to an aligned region.
+	void *map(size_t size, size_t alignment) {
+		size_t over = size + alignment;
+		void *raw = mmap(nullptr, over, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (raw == MAP_FAILED)
+			return nullptr;
+		auto base = reinterpret_cast<uintptr_t>(raw);
+		auto aligned = (base + alignment - 1) & ~(alignment - 1);
+		if (aligned > base)
+			munmap(reinterpret_cast<void *>(base), aligned - base);
+		if (aligned + size < base + over)
+			munmap(reinterpret_cast<void *>(aligned + size), (base + over) - (aligned + size));
+		return reinterpret_cast<void *>(aligned);
+	}
+};
+
+using domain_type = frg::sharded_slab::domain<sharded_slab_policy>;
 using pool_type = frg::sharded_slab::pool<sharded_slab_policy>;
+
+// Opts in but provides no aligned map(): over-aligned objects use the over-allocation fallback.
+struct sharded_slab_fallback_policy : sharded_slab_base_policy {
+	static constexpr bool support_overaligned = true;
+	using mutex_type = frg::simple_spinlock;
+};
+
+using fallback_domain_type = frg::sharded_slab::domain<sharded_slab_fallback_policy>;
+using fallback_pool_type = frg::sharded_slab::pool<sharded_slab_fallback_policy>;
 
 // Check all powers of two from 2^0 to 2^30 to check whether all size classes and large allocations work.
 TEST(sharded_slab, multiple_sizes) {
-	pool_type pool;
+	domain_type dom;
+	pool_type pool{&dom};
 
 	for (int s = 0; s <= 30; s++) {
 		size_t size = size_t{1} << s;
@@ -35,11 +71,101 @@ TEST(sharded_slab, multiple_sizes) {
 	}
 }
 
+// Allocate with alignments below chunk_boundary (slab and large paths).
+TEST(sharded_slab, alignment) {
+	domain_type dom;
+	pool_type pool{&dom};
+
+	for (int a = 0; a < frg::floor_log2(pool_type::chunk_boundary); a++) {
+		size_t alignment = size_t{1} << a;
+		for (size_t size : {alignment / 2, alignment, alignment * 2}) {
+			if (!size)
+				continue;
+			void *obj = pool.allocate(size, alignment);
+			ASSERT_NE(obj, nullptr);
+			EXPECT_EQ(reinterpret_cast<uintptr_t>(obj) & (alignment - 1), uintptr_t{0});
+			memset(obj, 0xFF, size);
+			pool.deallocate(obj);
+		}
+	}
+}
+
+// Allocate with alignments at and above chunk_boundary (shared side structure).
+TEST(sharded_slab, overalignment) {
+	domain_type dom;
+	pool_type pool{&dom};
+
+	for (int a = frg::floor_log2(pool_type::chunk_boundary); a <= 24; a++) {
+		size_t alignment = size_t{1} << a;
+		for (size_t size : {alignment / 2, alignment, alignment * 2}) {
+			void *obj = pool.allocate(size, alignment);
+			ASSERT_NE(obj, nullptr);
+			EXPECT_EQ(reinterpret_cast<uintptr_t>(obj) & (alignment - 1), uintptr_t{0});
+			EXPECT_GE(pool.get_size(obj), size);
+			memset(obj, 0xFF, size);
+			pool.deallocate(obj);
+		}
+	}
+}
+
+// Over-aligned objects from one pool can be freed by another in the same domain.
+TEST(sharded_slab, overaligned_cross_thread) {
+	constexpr size_t count = 256;
+	size_t alignment = pool_type::chunk_boundary;
+
+	domain_type dom;
+	pool_type main_pool{&dom};
+	std::vector<void *> objs(count);
+
+	for (size_t i = 0; i < count; i++) {
+		objs[i] = main_pool.allocate(alignment, alignment);
+		ASSERT_NE(objs[i], nullptr);
+		EXPECT_EQ(reinterpret_cast<uintptr_t>(objs[i]) & (alignment - 1), uintptr_t{0});
+		memset(objs[i], 0xFF, alignment);
+	}
+	std::thread t([&] {
+		pool_type thread_pool{&dom};
+		for (size_t i = 0; i < count; i++)
+			thread_pool.deallocate(objs[i]);
+	});
+	t.join();
+}
+
+// Over-aligned objects fall back to over-allocation when map() has no aligned overload.
+TEST(sharded_slab, overalignment_fallback) {
+	fallback_domain_type dom;
+	fallback_pool_type pool{&dom};
+
+	for (int a = frg::floor_log2(fallback_pool_type::chunk_boundary); a <= 22; a++) {
+		size_t alignment = size_t{1} << a;
+		for (size_t size : {alignment / 2, alignment, alignment * 2}) {
+			void *obj = pool.allocate(size, alignment);
+			ASSERT_NE(obj, nullptr);
+			EXPECT_EQ(reinterpret_cast<uintptr_t>(obj) & (alignment - 1), uintptr_t{0});
+			EXPECT_GE(pool.get_size(obj), size);
+			memset(obj, 0xFF, size);
+			pool.deallocate(obj);
+		}
+	}
+}
+
+// Without opt-in, normal allocations still work but over-aligned requests fail.
+TEST(sharded_slab, overaligned_unsupported) {
+	frg::sharded_slab::pool<sharded_slab_base_policy> pool;
+
+	void *p = pool.allocate(128);
+	ASSERT_NE(p, nullptr);
+	pool.deallocate(p);
+
+	EXPECT_EQ(pool.allocate(128, pool_type::chunk_boundary), nullptr);
+}
+
 // Allocate enough objects to exhaust one chunk.
 TEST(sharded_slab, exhaust_chunk) {
 	constexpr size_t count = 20000;
 
-	pool_type pool;
+	domain_type dom;
+	pool_type pool{&dom};
 	std::vector<void *> objs(count);
 
 	for (size_t i = 0; i < 5; ++i) {
@@ -56,7 +182,8 @@ TEST(sharded_slab, exhaust_chunk) {
 TEST(sharded_slab, pointer_uniqueness) {
 	constexpr size_t count = 1000;
 
-	pool_type pool;
+	domain_type dom;
+	pool_type pool{&dom};
 	std::vector<void *> objs(count);
 
 	for (size_t i = 0; i < 5; ++i) {
@@ -78,7 +205,8 @@ TEST(sharded_slab, pointer_uniqueness) {
 TEST(sharded_slab, cross_thread_deallocation) {
 	constexpr size_t count = 20000;
 
-	pool_type main_pool;
+	domain_type dom;
+	pool_type main_pool{&dom};
 	std::vector<void *> objs(count);
 
 	for (size_t i = 0; i < 5; ++i) {
@@ -89,7 +217,7 @@ TEST(sharded_slab, cross_thread_deallocation) {
 			memset(objs[i], 0xFF, 128);
 		}
 		std::thread t([&] {
-			pool_type thread_pool;
+			pool_type thread_pool{&dom};
 			for (size_t i = 0; i < count; i++)
 				thread_pool.deallocate(objs[i]);
 		});
@@ -107,7 +235,8 @@ TEST(sharded_slab, cross_thread_deallocation) {
 }
 
 TEST(sharded_slab, reallocate) {
-	pool_type pool;
+	domain_type dom;
+	pool_type pool{&dom};
 
 	size_t delta = 15;
 	std::array<size_t, 2> sizes = {256 - delta, 1024 * 1024 - delta};
@@ -156,7 +285,8 @@ TEST(sharded_slab, reallocate) {
 }
 
 TEST(sharded_slab, get_size) {
-	pool_type pool;
+	domain_type dom;
+	pool_type pool{&dom};
 
 	EXPECT_EQ(pool.get_size(nullptr), 0);
 
@@ -171,7 +301,7 @@ TEST(sharded_slab, get_size) {
 	pool.deallocate(p_large);
 }
 
-struct poison_policy : sharded_slab_policy {
+struct poison_policy : sharded_slab_base_policy {
 	static inline std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
 
 	void clear_range(uintptr_t start, uintptr_t end) {
@@ -239,7 +369,7 @@ TEST(sharded_slab, poisoning) {
 	EXPECT_FALSE(exact_match);
 }
 
-struct trace_policy : sharded_slab_policy {
+struct trace_policy : sharded_slab_base_policy {
 	static inline std::vector<uint8_t> buffer;
 
 	bool enable_trace() { return true; }

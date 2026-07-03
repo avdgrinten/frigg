@@ -3,12 +3,17 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <atomic>
+#include <bit>
 #include <concepts>
 #include <new>
 
 #include <frg/bitops.hpp>
 #include <frg/expected.hpp>
 #include <frg/macros.hpp>
+#include <frg/mutex.hpp>
+#include <frg/rbtree.hpp>
+#include <frg/safe_int.hpp>
+#include <frg/scope_exit.hpp>
 #include <frg/slab.hpp>
 #include <frg/string_stub.hpp>
 
@@ -25,7 +30,6 @@ enum class error {
 //       in particular:
 //       * Slab size and page size overrides
 //       * Bucket customizations
-//       * Aligned page mapping functions
 template<typename P>
 concept Policy = requires(P policy, void *p, size_t size) {
 	// The map() and unmap() functions can be used to allocate and free memory at page granularity.
@@ -33,13 +37,102 @@ concept Policy = requires(P policy, void *p, size_t size) {
 	{ policy.unmap(p, size) } -> std::same_as<void>;
 };
 
+template<typename P>
+concept aligned_map_policy = Policy<P> && requires(P policy, void *p, size_t size, size_t align) {
+	{ policy.map(size, align) } -> std::same_as<void *>;
+};
+
+// A policy opts into over-aligned allocations by setting support_overaligned to true.
+// Such a policy must additionally provide a mutex_type.
+template<typename P>
+concept overaligned_policy = requires {
+	{ P::support_overaligned } -> std::convertible_to<bool>;
+	requires P::support_overaligned;
+};
+
+// Yields P::mutex_type when the policy provides one.
+template<typename P>
+struct mutex_type_helper { struct type { }; };
+
+template<typename P> requires requires { typename P::mutex_type; }
+struct mutex_type_helper<P> { using type = typename P::mutex_type; };
+
+// Metadata for an overaligned object.
+// Stored outside of the object's allocation such that the allocation itself can be aligned.
+struct overaligned_node {
+	uintptr_t const object;
+	void *const extent_ptr;
+	size_t const extent_size;
+	// Protected by overaligend_shard::mutex.
+	rbtree_hook hook;
+};
+
+template<Policy P>
+struct pool;
+
+// Data shared between cooperating pools.
+// The same domain must be passed to every pool that allocates or frees over-aligned objects under the same policy.
+template<Policy P>
+struct domain {
+	friend struct pool<P>;
+
+	domain() = default;
+
+	domain(const domain &) = delete;
+
+	domain &operator= (const domain &) = delete;
+
+private:
+	using mutex_type = typename mutex_type_helper<P>::type;
+
+	static constexpr size_t num_shards = 64;
+
+	struct overaligned_less {
+		bool operator() (const overaligned_node &a, const overaligned_node &b) {
+			return a.object < b.object;
+		}
+	};
+
+	// Trees for overaligned objects are sharded based on a hash of their addresses.
+	// This avoids a global lock for all overallocated objects.
+	struct overaligned_shard {
+		mutex_type mutex;
+		rbtree<overaligned_node, &overaligned_node::hook, overaligned_less> tree;
+	};
+
+	static size_t overaligned_shard_of(uintptr_t object) {
+		// Over-aligned objects are chunk_boundary-aligned, so their low bits are zero;
+		// a multiplicative hash spreads the high bits across the shards.
+		return (object * 0x9E3779B97F4A7C15ull) >> (64 - floor_log2(num_shards));
+	}
+
+	overaligned_node *find(overaligned_shard *s, uintptr_t object) {
+		auto *current = s->tree.get_root();
+		while (current) {
+			if (object < current->object) {
+				current = decltype(s->tree)::get_left(current);
+			} else if (object > current->object) {
+				current = decltype(s->tree)::get_right(current);
+			} else {
+				return current;
+			}
+		}
+		return nullptr;
+	}
+
+	overaligned_shard overaligned_shards_[num_shards];
+};
+
 // Thread-aware slab allocator.
 // The pool struct itself is not thread-safe; however, objects allocated
 // from one pool instance can be freed by another pool instance
-// as long as the policy is identical.
+// as long as the policy is identical (and, for over-aligned objects, the
+// pools share the same domain).
 template<Policy P>
 struct pool {
 	using policy_traits = slab_policy_traits<P>;
+
+	using domain_type = domain<P>;
 
 	static constexpr size_t page_size = 4096;
 	static constexpr size_t chunk_boundary = 1 << 18;
@@ -140,7 +233,16 @@ struct pool {
 		size_t extent_size{0};
 	};
 
-	constexpr pool() {
+	// True if the policy opted into over-aligned allocations.
+	static constexpr bool supports_overaligned = overaligned_policy<P>;
+
+	using mutex_type = typename mutex_type_helper<P>::type;
+
+	constexpr pool() requires (!supports_overaligned)
+	: pool{nullptr} { }
+
+	constexpr pool(domain_type *dom)
+	: dom_{dom} {
 		for (size_t i = 0; i < policy_traits::num_buckets; i++) {
 			buckets_[i].object_size = policy_traits::bucket_to_size(i);
 		}
@@ -148,14 +250,14 @@ struct pool {
 
 	void *allocate(size_t size) {
 		void *obj;
-		if (size > policy_traits::max_bucket_size) {
-			auto result = large_allocate(size);
+		if (size <= policy_traits::max_bucket_size) {
+			auto idx = policy_traits::size_to_bucket(size);
+			auto result = slab_allocate(&buckets_[idx], size);
 			if (!result)
 				return nullptr;
 			obj = result.value();
 		} else {
-			auto idx = policy_traits::size_to_bucket(size);
-			auto result = slab_allocate(&buckets_[idx], size);
+			auto result = large_allocate(size, 1);
 			if (!result)
 				return nullptr;
 			obj = result.value();
@@ -164,6 +266,53 @@ struct pool {
 		return obj;
 	}
 
+	// Allocate an object of the given size that is aligned to at least the given alignment.
+	// The alignment must be a power of two.
+	void *allocate(size_t size, size_t alignment) {
+		FRG_ASSERT(std::has_single_bit(alignment));
+
+		// Treat size zero allocations as size 1 to guarantee alignment.
+		// This appears to be demanded by posix_memalign() if we return a non-nullptr.
+		if (!size)
+			size = 1;
+		size_t size_plus_align_minus_1;
+		if (!checked_add(size, alignment - 1, size_plus_align_minus_1))
+			return nullptr;
+		auto aligned_size = size_plus_align_minus_1 & ~(alignment - 1);
+
+		void *obj;
+		if (aligned_size <= policy_traits::max_bucket_size) {
+			// For slabs, it is enough to align the size to get an aligned bucket.
+			static_assert(policy_traits::aligned_size_implies_aligned_bucket());
+			auto idx = policy_traits::size_to_bucket(aligned_size);
+			auto result = slab_allocate(&buckets_[idx], size);
+			if (!result)
+				return nullptr;
+			obj = result.value();
+		} else if(alignment < chunk_boundary) {
+			// For large objects, the chunk header is at chunk_boundary,
+			// so large objects can be aligned by up to (but not including) chunk_boundary.
+			auto result = large_allocate(size, alignment);
+			if (!result)
+				return nullptr;
+			obj = result.value();
+		} else [[unlikely]] {
+			if constexpr (supports_overaligned) {
+				// Overaligned object that stores meta data outside of its allocation.
+				// An object is overaligned if and only if its address is a multiple of chunk_boundary.
+				auto result = overaligned_allocate(size, alignment);
+				if (!result)
+					return nullptr;
+				obj = result.value();
+			} else {
+				return nullptr;
+			}
+		}
+		slab::trace(policy_, 'a', obj, size);
+		return obj;
+	}
+
+	// Note that this function may drop alignment from already aligend objects.
 	void *reallocate(void *object, size_t new_size) {
 		if (!object)
 			return allocate(new_size);
@@ -172,16 +321,7 @@ struct pool {
 			return nullptr;
 		}
 
-		auto chunk = chunk_header_of(object);
-		size_t capacity;
-		if (chunk->type == chunk_type::slab) {
-			capacity = chunk->bkt->object_size;
-		} else {
-			FRG_ASSERT(chunk->type == chunk_type::large);
-			uintptr_t limit = reinterpret_cast<uintptr_t>(chunk->extent_ptr) + chunk->extent_size;
-			uintptr_t start = reinterpret_cast<uintptr_t>(object);
-			capacity = limit - start;
-		}
+		size_t capacity = capacity_of(object);
 
 		if (new_size <= capacity) {
 			if constexpr (slab::has_poisoning_support<P>) {
@@ -203,6 +343,14 @@ struct pool {
 		slab::trace(policy_, 'f', object, 0);
 		if (!object)
 			return;
+		if constexpr (supports_overaligned) {
+			if (is_overaligned(object)) {
+				overaligned_free(object);
+				return;
+			}
+		} else {
+			FRG_ASSERT(!is_overaligned(object));
+		}
 		auto chunk = chunk_header_of(object);
 		if (chunk->type == chunk_type::large) {
 			large_free(chunk);
@@ -218,19 +366,35 @@ struct pool {
 	size_t get_size(void *object) {
 		if (!object)
 			return 0;
-		auto chunk = chunk_header_of(object);
-		if (chunk->type == chunk_type::slab) {
-			return chunk->bkt->object_size;
-		} else {
-			FRG_ASSERT(chunk->type == chunk_type::large);
-			uintptr_t limit = reinterpret_cast<uintptr_t>(chunk->extent_ptr) + chunk->extent_size;
-			uintptr_t start = reinterpret_cast<uintptr_t>(object);
-			return limit - start;
-		}
+		return capacity_of(object);
 	}
 
 private:
+	// An object is over-aligned exactly if it sits on a chunk_boundary.
+	// Slab and large objects always sit at a non-zero offset from their chunk_boundary
+	// (as the chunk header sits at chunk_boundary).
+	static bool is_overaligned(void *object) {
+		return (reinterpret_cast<uintptr_t>(object) & (chunk_boundary - 1)) == 0;
+	}
+
+	// Usable capacity (in bytes) of an allocated object.
+	size_t capacity_of(void *object) {
+		if constexpr (supports_overaligned) {
+			if (is_overaligned(object))
+				return overaligned_capacity(object);
+		} else {
+			FRG_ASSERT(!is_overaligned(object));
+		}
+		auto chunk = chunk_header_of(object);
+		if (chunk->type == chunk_type::slab)
+			return chunk->bkt->object_size;
+		FRG_ASSERT(chunk->type == chunk_type::large);
+		return reinterpret_cast<uintptr_t>(chunk->extent_ptr) + chunk->extent_size
+			- reinterpret_cast<uintptr_t>(object);
+	}
+
 	// Find the chunk_header for an object by aligning the pointer down to chunk_boundary.
+	// Precondition: !is_overaligned(object).
 	chunk_header *chunk_header_of(void *object) {
 		auto addr = reinterpret_cast<uintptr_t>(object);
 		auto aligned = addr & ~(chunk_boundary - 1);
@@ -247,19 +411,39 @@ private:
 		return reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(chunk) + ca);
 	}
 
+	struct aligned_mapping {
+		void *extent_ptr;
+		size_t extent_size;
+		uintptr_t address;
+	};
+
+	// Map a region that contains an address aligned to the given alignment.
+	frg::expected<error, aligned_mapping> map_aligned(size_t size, size_t alignment) {
+		if constexpr (aligned_map_policy<P>) {
+			size_t extent_size = (size + page_size - 1) & ~(page_size - 1);
+			void *extent_ptr = policy_.map(extent_size, alignment);
+			if (!extent_ptr)
+				return error::allocation_failed;
+			return aligned_mapping{extent_ptr, extent_size, reinterpret_cast<uintptr_t>(extent_ptr)};
+		} else {
+			// There is no aligned map() function, so we need to overallocate.
+			size_t extent_size = (size + alignment - 1 + page_size - 1) & ~(page_size - 1);
+			void *extent_ptr = policy_.map(extent_size);
+			if (!extent_ptr)
+				return error::allocation_failed;
+			return aligned_mapping{
+				extent_ptr,
+				extent_size,
+				(reinterpret_cast<uintptr_t>(extent_ptr) + alignment - 1) & ~(alignment - 1)
+			};
+		}
+	}
+
 	frg::expected<error> slab_chunk_create(bucket *bkt) {
 		FRG_ASSERT(!bkt->head_chunk);
 
-		// Over-allocate to ensure we can align to chunk_boundary.
-		auto extent_size = (chunk_size + chunk_boundary - 1 + page_size - 1) & ~(page_size - 1);
-		auto extent_ptr = policy_.map(extent_size);
-		if (!extent_ptr)
-			return error::allocation_failed;
-
-		// Align up to chunk_boundary.
-		auto raw_addr = reinterpret_cast<uintptr_t>(extent_ptr);
-		auto aligned_addr = (raw_addr + chunk_boundary - 1) & ~(chunk_boundary - 1);
-		auto chunk = reinterpret_cast<chunk_header *>(aligned_addr);
+		auto mapping = FRG_TRY(map_aligned(chunk_size, chunk_boundary));
+		auto chunk = reinterpret_cast<chunk_header *>(mapping.address);
 
 		if constexpr (slab::has_poisoning_support<P>)
 			policy_.unpoison(chunk, sizeof(chunk_header));
@@ -275,13 +459,17 @@ private:
 					.inactive{false},
 				}
 			},
-			.extent_ptr{extent_ptr},
-			.extent_size{extent_size},
+			.extent_ptr{mapping.extent_ptr},
+			.extent_size{mapping.extent_size},
 		};
 
 		// Build free list of all objects in the chunk.
 		size_t object_size = bkt->object_size;
-		size_t first_offset = (sizeof(chunk_header) + object_size - 1) & ~(object_size - 1);
+		// Place the first object after the header, aligned to the largest power of two dividing object_size.
+		// This is the greatest alignment that this bucket can serve, see aligned_size_implies_aligned_bucket().
+		static_assert(policy_traits::aligned_size_implies_aligned_bucket());
+		size_t object_align = size_t{1} << std::countr_zero(object_size);
+		size_t first_offset = (sizeof(chunk_header) + object_align - 1) & ~(object_align - 1);
 
 		compressed_address prev = 0;
 		size_t count = 0;
@@ -512,37 +700,28 @@ private:
 			std::memory_order_relaxed));
 	}
 
-	frg::expected<error, void *> large_allocate(size_t size) {
+	frg::expected<error, void *> large_allocate(size_t size, size_t alignment) {
 		// Compute the space needed after alignment.
-		// Object starts after chunk_header, aligned to page boundary for large objects.
-		size_t object_alignment = 4096;
+		// Object starts after chunk_header, aligned to at least the page boundary for large objects.
+		size_t object_alignment = (alignment < page_size) ? page_size : alignment;
 		size_t first_offset = (sizeof(chunk_header) + object_alignment - 1) & ~(object_alignment - 1);
-		size_t data_size = first_offset + size;
 
-		// Over-allocate to ensure we can align to chunk_boundary.
-		auto extent_size = (data_size + chunk_boundary - 1 + page_size - 1) & ~(page_size - 1);
-		auto extent_ptr = policy_.map(extent_size);
-		if (!extent_ptr)
-			return error::allocation_failed;
-
-		// Align up to chunk_boundary.
-		auto raw_addr = reinterpret_cast<uintptr_t>(extent_ptr);
-		auto aligned_addr = (raw_addr + chunk_boundary - 1) & ~(chunk_boundary - 1);
-		auto chunk = reinterpret_cast<chunk_header *>(aligned_addr);
+		auto mapping = FRG_TRY(map_aligned(first_offset + size, chunk_boundary));
+		auto chunk = reinterpret_cast<chunk_header *>(mapping.address);
 
 		if constexpr (slab::has_poisoning_support<P>) {
 			policy_.unpoison(chunk, sizeof(chunk_header));
-			policy_.unpoison(reinterpret_cast<void *>(aligned_addr + first_offset), size);
+			policy_.unpoison(reinterpret_cast<void *>(mapping.address + first_offset), size);
 		}
 
 		new (chunk) chunk_header{
 			.type{chunk_type::large},
 			.owner{this},
-			.extent_ptr{extent_ptr},
-			.extent_size{extent_size},
+			.extent_ptr{mapping.extent_ptr},
+			.extent_size{mapping.extent_size},
 		};
 
-		return reinterpret_cast<void *>(aligned_addr + first_offset);
+		return reinterpret_cast<void *>(mapping.address + first_offset);
 	}
 
 	void large_free(chunk_header *chunk) {
@@ -557,11 +736,89 @@ private:
 		policy_.unmap(extent_ptr, extent_size);
 	}
 
+	size_t overaligned_capacity(void *object) requires (supports_overaligned) {
+		FRG_ASSERT(dom_);
+
+		auto key = reinterpret_cast<uintptr_t>(object);
+		auto s = &dom_->overaligned_shards_[domain_type::overaligned_shard_of(key)];
+
+		overaligned_node *node;
+		{
+			unique_lock<mutex_type> guard(s->mutex);
+			node = dom_->find(s, key);
+			FRG_ASSERT(node);
+		}
+
+		return reinterpret_cast<uintptr_t>(node->extent_ptr) + node->extent_size - node->object;
+	}
+
+	frg::expected<error, void *> overaligned_allocate(size_t size, size_t alignment)
+	requires (supports_overaligned) {
+		FRG_ASSERT(dom_);
+
+		auto mapping = FRG_TRY(map_aligned(size, alignment));
+		auto object = reinterpret_cast<void *>(mapping.address);
+		scope_exit unmap_on_error{[&] {
+			policy_.unmap(mapping.extent_ptr, mapping.extent_size);
+		}};
+
+		if constexpr (slab::has_poisoning_support<P>)
+			policy_.unpoison(reinterpret_cast<void *>(object), size);
+
+		// Self-host the node from the slab path; it is a normal object that any pool can free.
+		auto node_result = slab_allocate(
+			&buckets_[policy_traits::size_to_bucket(sizeof(overaligned_node))],
+			sizeof(overaligned_node)
+		);
+		if (!node_result)
+			return error::allocation_failed;
+		auto node = new (node_result.value()) overaligned_node{
+			mapping.address, mapping.extent_ptr, mapping.extent_size, {}
+		};
+
+		auto key = mapping.address;
+		auto s = &dom_->overaligned_shards_[domain_type::overaligned_shard_of(key)];
+		{
+			unique_lock<mutex_type> guard(s->mutex);
+			s->tree.insert(node);
+		}
+
+		unmap_on_error.release();
+		return reinterpret_cast<void *>(object);
+	}
+
+	void overaligned_free(void *object) requires (supports_overaligned) {
+		FRG_ASSERT(dom_);
+
+		auto key = reinterpret_cast<uintptr_t>(object);
+		auto s = &dom_->overaligned_shards_[domain_type::overaligned_shard_of(key)];
+		overaligned_node *node;
+		{
+			unique_lock<mutex_type> guard(s->mutex);
+			node = dom_->find(s, key);
+			FRG_ASSERT(node);
+			s->tree.remove(node);
+		}
+
+		if constexpr (slab::has_poisoning_support<P>) {
+			policy_.unpoison_expand(node->extent_ptr, node->extent_size);
+			policy_.poison(node->extent_ptr, node->extent_size);
+		}
+		policy_.unmap(node->extent_ptr, node->extent_size);
+
+		// Deallocate the self-hosted node struct.
+		deallocate(node);
+	}
+
 	P policy_;
 	bucket buckets_[policy_traits::num_buckets];
+	domain_type *dom_ = nullptr;
 };
 
 } // namespace sharded_slab
+
+template<sharded_slab::Policy P>
+using sharded_slab_domain = sharded_slab::domain<P>;
 
 template<sharded_slab::Policy P>
 using sharded_slab_pool = sharded_slab::pool<P>;
