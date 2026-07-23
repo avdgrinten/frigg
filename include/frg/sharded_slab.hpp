@@ -175,7 +175,12 @@ struct pool {
 	};
 	static_assert(sizeof(chunk_state) == 8);
 	static_assert(alignof(chunk_state) == 8);
+	// We used to do this for all architectures, but some architectures do not
+	// implement this as builtins. These should provide the required libatomic
+	// symbols themselves, if needed.
+#if defined(__x86_64__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch64)
 	static_assert(std::atomic<chunk_state>::is_always_lock_free);
+#endif
 
 	// Limit on the number of objects due to number of bits of threaded_count.
 	static constexpr size_t max_objects_in_chunk = (size_t{1} << 31) - 1;
