@@ -771,6 +771,12 @@ void do_printf_ints(S &sink, Char t, format_options opts,
 	if (opts.precision)
 		opts.fill_zeros = false;
 
+	// [C23-7.23.6.1] The '+' and ' ' flags are only defined for signed conversions.
+	if(t != 'd' && t != 'i') {
+		opts.always_sign = false;
+		opts.plus_becomes_space = false;
+	}
+
 	switch(t) {
 	case 'd':
 	case 'i': {
