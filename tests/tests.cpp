@@ -460,6 +460,24 @@ TEST(formatting, printf) {
 	do_test("-12", "% +d", -12);
 	do_test("-12", "%+ d", -12);
 
+	// The '+' and ' ' flags are only defined for signed conversions and must be
+	// ignored for 'b', 'B', 'o', 'u', 'x' and 'X', including when computing the
+	// field width.
+	do_test("80", "% x", 128);
+	do_test("80", "%+x", 128);
+	do_test("80", "% X", 128);
+	do_test("128", "% u", 128u);
+	do_test("128", "%+u", 128u);
+	do_test("10", "% o", 8u);
+	do_test("10", "%+o", 8u);
+	do_test("101", "% b", 5u);
+	do_test("101", "%+b", 5u);
+	do_test("   80", "% 5x", 128);
+	do_test("  128", "%+5u", 128u);
+	do_test("00080", "% 05x", 128);
+	do_test("", "% .0x", 0);
+	do_test("", "%+.0u", 0u);
+
 	// Test '#' flag.
 	do_test("0xc", "%#x", 12);
 	do_test("0XC", "%#X", 12);
@@ -538,6 +556,21 @@ TEST(formatting, printf) {
 	do_test("1.234E+04", "%.3E", 12345.0);
 	do_test("1.234e-04", "%.3e", 0.00012345);
 	do_test("-1.234E-04", "%.3E", -0.00012345);
+
+	// Test the field width for numbers printed in exponential form.
+	do_test("     1.2346E+03", "%15.4E", 1234.5678);
+	do_test("   6.667e-05", "%12.3e", 6.6667e-05);
+	do_test("  6.6667E-05", "%12.5G", 6.6667e-05);
+	do_test(" -6.6667e-05", "%12.4e", -6.6667e-05);
+	do_test("0006.667e-05", "%012.3e", 6.6667e-05);
+	do_test("    0.00e+00", "%12.2e", 0.0);
+	do_test("       1.500000E-300", "%20.6E", 1.5e-300);
+	do_test("       1.500000e+300", "%20.6e", 1.5e300);
+
+	// Left-justified output pads
+	do_test("1.2346e+03     ", "%-15.4e", 1234.5678);
+	do_test("6.667e-05   ", "%-12.3e", 6.6667e-05);
+	do_test("1.500000E-300       ", "%-20.6E", 1.5e-300);
 
 	// Test %g/%G behavior
 	do_test("123456", "%g", 123456.0); // Should not use e-notation
@@ -664,6 +697,16 @@ TEST(formatting, printf) {
 
 	do_test("001.00d", "%1$0*4$.*2$f%3$s", 1.0, 2, "d", 6);
 	do_test("01234.568", "%2$0*1$.*3$Lf", 9, 1234.56789L, 3);
+
+	do_test("42", "%#d", 42);
+	do_test("42", "%#i", 42);
+	do_test("42", "%#u", 42u);
+	do_test("-8531", "%#hi", 0xdead);
+	do_test("       +7", "%#+ 9hhi", 0x7);
+	do_test("        6", "%# 9hhd", 0x6);
+	do_test("-00107", "%#06hhi", 0x95);
+	do_test(" 4", "%# hhd", 0x4);
+	do_test("3", "%# hhu", 0x3);
 }
 
 #include <frg/bitset.hpp>
