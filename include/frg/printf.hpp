@@ -777,10 +777,13 @@ void do_printf_ints(S &sink, Char t, format_options opts,
 		opts.plus_becomes_space = false;
 	}
 
+	// The '#' flag is only defined for 'b', 'B', 'o', 'x' and 'X'.
+	if(t == 'd' || t == 'i' || t == 'u')
+		opts.alt_conversion = false;
+
 	switch(t) {
 	case 'd':
 	case 'i': {
-		FRG_ASSERT(!opts.alt_conversion);
 		long number;
 		if(szmod == printf_size_mod::char_size) {
 			number = pop_arg<signed char>(vsp, &opts);
@@ -913,7 +916,6 @@ void do_printf_ints(S &sink, Char t, format_options opts,
 	} break;
 	case 'u': {
 		auto print = [&] (auto number) {
-			FRG_ASSERT(!opts.alt_conversion);
 			if(opts.precision && *opts.precision == 0 && !number) {
 				pad_to_min();
 			}else{
