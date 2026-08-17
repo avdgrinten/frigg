@@ -344,7 +344,7 @@ namespace _fmt_basics {
 			bool exponential_form = false, bool print_hexfloat = false, locale_options<Char> locale_opts = {}) {
 		using P = frg::FormatterPolicy<Char>;
 
-		auto textLength = [](int i, unsigned base = 10, bool ignoreSign = false) {
+		auto textLength = [](int i, int base = 10, bool ignoreSign = false) {
 			int length = (i < 0 && !ignoreSign) ? 1 : 0;
 			do {
 				i /= base;
@@ -584,7 +584,7 @@ namespace _fmt_basics {
 
 		// Handle the exponent in the style of `e+09`
 		if (exponential_form)
-			total_length += 2 + frg::max(2, textLength(exponent));
+			total_length += 2 + frg::max(2, textLength(exponent, 10, true));
 
 		auto pad_length = width > total_length ? width - total_length : 0;
 
@@ -605,17 +605,17 @@ namespace _fmt_basics {
 		if (*precision > 0)
 			print_int<S, decltype(fracDigits), Char>(sink, fracDigits, 10, *precision, *precision, '0');
 
+		if (exponential_form) {
+			sink.append(use_capitals ? 'E' : 'e');
+
+			print_int<S, decltype(exponent), Char>(sink, exponent, 10, 2, 2, '0', false, false, true);
+		}
+
 		if (left_justify) {
 			while (pad_length > 0) {
 				sink.append(padding);
 				pad_length--;
 			}
-		}
-
-		if (exponential_form) {
-			sink.append(use_capitals ? 'E' : 'e');
-
-			print_int<S, decltype(exponent), Char>(sink, exponent, 10, 2, 2, '0', false, false, true);
 		}
 	}
 
