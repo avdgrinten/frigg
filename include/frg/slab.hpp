@@ -545,6 +545,10 @@ void *slab_pool<Policy, Mutex>::allocate(size_t length) {
 		return object;
 	}else{
 		auto area_size = (length + page_size - 1) & ~(page_size - 1);
+		// Rounding up to a page boundary wraps for lengths close to the maximum
+		// of size_t.
+		if(area_size < length)
+			return nullptr;
 		auto fra = _construct_large(area_size);
 		if(!fra)
 			return nullptr;
@@ -747,13 +751,17 @@ auto slab_pool<Policy, Mutex>::_construct_large(size_t area_size)
 	uintptr_t address;
 	if constexpr (is_detected_v<policy_map_aligned_t, Policy>) {
 		sb_reservation = area_size + huge_padding;
+		if(sb_reservation < area_size)
+			return nullptr;
 		sb_base = _plcy.map(sb_reservation, sb_size);
 		if(!sb_base)
 			return nullptr;
 		address = sb_base;
 	} else {
 		sb_reservation = area_size + huge_padding + sb_size;
-		sb_base = _plcy.map(area_size + huge_padding + sb_size);
+		if(sb_reservation < area_size)
+			return nullptr;
+		sb_base = _plcy.map(sb_reservation);
 		if(!sb_base)
 			return nullptr;
 		address = (sb_base + sb_size - 1) & ~(sb_size - 1);
