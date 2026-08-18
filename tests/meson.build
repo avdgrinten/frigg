@@ -3,6 +3,7 @@ gtest = dependency('gtest_main')
 test_executable = executable('frigg_tests',
 	'safe_int.cpp',
 	'sharded_slab.cpp',
+	'slab.cpp',
 	'support.cpp',
 	'tests.cpp',
 	dependencies: [
