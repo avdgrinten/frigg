@@ -60,45 +60,50 @@ constexpr uint32_t mix_bits_narrow32(T v) {
 template<typename T>
 class hash;
 
+// Unsigned types.
+
 template<>
-class hash<uint64_t> {
+class hash<unsigned int> {
 public:
-	constexpr unsigned int operator() (uint64_t v) const {
-		static_assert(sizeof(unsigned int) == 4, "Expected sizeof(int) == 4");
-		return (unsigned int)(v ^ (v >> 32));
+	constexpr unsigned int operator() (unsigned int v) const {
+		return mix_bits_narrow32(v);
 	}
 };
 
 template<>
-class hash<int64_t> {
+class hash<unsigned long> {
 public:
-	constexpr unsigned int operator() (int64_t v) const {
-		static_assert(sizeof(unsigned int) == 4, "Expected sizeof(int) == 4");
-		return (unsigned int)(v ^ (v >> 32));
+	constexpr unsigned int operator() (unsigned long v) const {
+		return mix_bits_narrow32(v);
 	}
 };
+
+// Signed types.
 
 template<>
 class hash<int> {
 public:
 	constexpr unsigned int operator() (int v) const {
-		return v;
+		return mix_bits_narrow32(static_cast<unsigned int>(v));
 	}
 };
 
 template<>
-class hash<unsigned int> {
+class hash<long> {
 public:
-	constexpr unsigned int operator() (int v) const {
-		return v;
+	constexpr unsigned int operator() (long v) const {
+		return mix_bits_narrow32(static_cast<unsigned long>(v));
 	}
 };
+
+// Other types.
 
 template<typename T>
 class hash<T *> {
 public:
 	constexpr unsigned int operator() (T *p) const {
-		return reinterpret_cast<uintptr_t>(p);
+		auto v = reinterpret_cast<uintptr_t>(p);
+		return mix_bits_narrow32(v);
 	}
 };
 
