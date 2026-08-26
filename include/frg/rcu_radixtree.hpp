@@ -289,13 +289,13 @@ private:
 	}
 
 public:
-	// Note: The iterator interface is *not* safe in the presence of concurrent modification.
+	// Note: The unsafe_iterator interface is *not* safe in the presence of concurrent modification.
 	//       Only use this interface while there are no concurrent writers.
-	struct iterator {
-		explicit iterator()
+	struct unsafe_iterator {
+		explicit unsafe_iterator()
 		: _n{nullptr}, _idx{16} { }
 
-		explicit iterator(entry_node *n, unsigned int idx)
+		explicit unsafe_iterator(entry_node *n, unsigned int idx)
 		: _n{n}, _idx{idx} { }
 
 		void operator++ () {
@@ -326,10 +326,10 @@ public:
 			return std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
 		}
 
-		bool operator== (const iterator &other) const {
+		bool operator== (const unsafe_iterator &other) const {
 			return _n == other._n && _idx == other._idx;
 		}
-		bool operator!= (const iterator &other) const {
+		bool operator!= (const unsafe_iterator &other) const {
 			return !(*this == other);
 		}
 
@@ -343,20 +343,82 @@ public:
 		unsigned int _idx;
 	};
 
-	iterator begin() {
+	unsafe_iterator unsafe_begin() {
 		auto n = first_leaf(_root.load(std::memory_order_relaxed));
 		while(true) {
 			if(!n)
-				return iterator{};
+				return unsafe_iterator{};
 
 			// Try to find a present entry.
 			for(unsigned int idx = 0; idx < 16; idx++) {
 				if(n->mask.load(std::memory_order_relaxed) & (1 << idx))
-					return iterator{n, idx};
+					return unsafe_iterator{n, idx};
 			}
 
 			n = next_leaf(n);
 		}
+	}
+
+	unsafe_iterator unsafe_end() {
+		return unsafe_iterator{};
+	}
+
+	// RCU-safe iterator.
+	struct iterator {
+		explicit iterator()
+		: _tree{nullptr}, _n{nullptr}, _idx{16} { }
+
+		explicit iterator(rcu_radixtree *tree, entry_node *n, unsigned int idx)
+		: _tree{tree}, _n{n}, _idx{idx} { }
+
+		void operator++ () {
+			FRG_ASSERT(_idx < 16);
+
+			// The remainder of this leaf can be scanned without descending again.
+			auto mask = _n->mask.load(std::memory_order_acquire);
+			for(unsigned int idx = _idx + 1; idx < 16; idx++) {
+				if(mask & (uint16_t(1) << idx)) {
+					_idx = idx;
+					return;
+				}
+			}
+
+			// Leaving the leaf does require a fresh descent (the links above it can change).
+			auto last = _n->prefix | 0xF;
+			if(last == uint64_t(-1)) {
+				*this = iterator{};
+				return;
+			}
+			*this = _tree->lower_bound(last + 1);
+		}
+
+		T &operator* () {
+			return *std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
+		}
+		T *operator-> () {
+			return std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
+		}
+
+		bool operator== (const iterator &other) const {
+			return _n == other._n && _idx == other._idx;
+		}
+		bool operator!= (const iterator &other) const {
+			return !(*this == other);
+		}
+
+		uint64_t key() const {
+			FRG_ASSERT(_idx < 16);
+			return _n->prefix | _idx;
+		}
+
+	private:
+		rcu_radixtree *_tree;
+		entry_node *_n;
+		unsigned int _idx;
+	};
+
+	iterator begin() {
+		return lower_bound(0);
 	}
 
 	iterator end() {
@@ -393,7 +455,7 @@ public:
 					auto mask = cn->mask.load(std::memory_order_acquire);
 					for(unsigned int idx = idx_of(bound, ll); idx < 16; idx++) {
 						if(mask & (uint16_t(1) << idx))
-							return iterator{cn, idx};
+							return iterator{this, cn, idx};
 					}
 					// Erasure does not remove empty nodes, so this leaf can be exhausted.
 					break;
