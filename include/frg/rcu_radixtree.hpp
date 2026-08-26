@@ -289,13 +289,13 @@ private:
 	}
 
 public:
-	// Note: The iterator interface is *not* safe in the presence of concurrent modification.
+	// Note: The unsafe_iterator interface is *not* safe in the presence of concurrent modification.
 	//       Only use this interface while there are no concurrent writers.
-	struct iterator {
-		explicit iterator()
+	struct unsafe_iterator {
+		explicit unsafe_iterator()
 		: _n{nullptr}, _idx{16} { }
 
-		explicit iterator(entry_node *n, unsigned int idx)
+		explicit unsafe_iterator(entry_node *n, unsigned int idx)
 		: _n{n}, _idx{idx} { }
 
 		void operator++ () {
@@ -326,11 +326,16 @@ public:
 			return std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
 		}
 
-		bool operator== (const iterator &other) const {
+		bool operator== (const unsafe_iterator &other) const {
 			return _n == other._n && _idx == other._idx;
 		}
-		bool operator!= (const iterator &other) const {
+		bool operator!= (const unsafe_iterator &other) const {
 			return !(*this == other);
+		}
+
+		uint64_t key() const {
+			FRG_ASSERT(_idx < 16);
+			return _n->prefix | _idx;
 		}
 
 	private:
@@ -338,24 +343,152 @@ public:
 		unsigned int _idx;
 	};
 
-	iterator begin() {
+	unsafe_iterator unsafe_begin() {
 		auto n = first_leaf(_root.load(std::memory_order_relaxed));
 		while(true) {
 			if(!n)
-				return iterator{};
+				return unsafe_iterator{};
 
 			// Try to find a present entry.
 			for(unsigned int idx = 0; idx < 16; idx++) {
 				if(n->mask.load(std::memory_order_relaxed) & (1 << idx))
-					return iterator{n, idx};
+					return unsafe_iterator{n, idx};
 			}
 
 			n = next_leaf(n);
 		}
 	}
 
+	unsafe_iterator unsafe_end() {
+		return unsafe_iterator{};
+	}
+
+	// RCU-safe iterator.
+	struct iterator {
+		explicit iterator()
+		: _tree{nullptr}, _n{nullptr}, _idx{16} { }
+
+		explicit iterator(rcu_radixtree *tree, entry_node *n, unsigned int idx)
+		: _tree{tree}, _n{n}, _idx{idx} { }
+
+		void operator++ () {
+			FRG_ASSERT(_idx < 16);
+
+			// The remainder of this leaf can be scanned without descending again.
+			auto mask = _n->mask.load(std::memory_order_acquire);
+			for(unsigned int idx = _idx + 1; idx < 16; idx++) {
+				if(mask & (uint16_t(1) << idx)) {
+					_idx = idx;
+					return;
+				}
+			}
+
+			// Leaving the leaf does require a fresh descent (the links above it can change).
+			auto last = _n->prefix | 0xF;
+			if(last == uint64_t(-1)) {
+				*this = iterator{};
+				return;
+			}
+			*this = _tree->lower_bound(last + 1);
+		}
+
+		T &operator* () {
+			return *std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
+		}
+		T *operator-> () {
+			return std::launder(reinterpret_cast<T *>(_n->entries[_idx].buffer));
+		}
+
+		bool operator== (const iterator &other) const {
+			return _n == other._n && _idx == other._idx;
+		}
+		bool operator!= (const iterator &other) const {
+			return !(*this == other);
+		}
+
+		uint64_t key() const {
+			FRG_ASSERT(_idx < 16);
+			return _n->prefix | _idx;
+		}
+
+	private:
+		rcu_radixtree *_tree;
+		entry_node *_n;
+		unsigned int _idx;
+	};
+
+	iterator begin() {
+		return lower_bound(0);
+	}
+
 	iterator end() {
 		return iterator{};
+	}
+
+	// Returns an iterator to the first entry with a key >= k, or end().
+	// Like find(), this is RCU-safe.
+	iterator lower_bound(uint64_t k) {
+		// Path of link nodes from the root, together with the index we descended into.
+		// Link nodes have depths in [0, ll) and depths increase strictly along a path,
+		// hence at most ll link nodes can occur.
+		struct { link_node *node; unsigned int idx; } path[ll];
+		unsigned int height = 0;
+
+		auto n = _root.load(std::memory_order_acquire);
+		// Lower bound that applies below the current node.
+		// Raised to a subtree's prefix whenever we enter a subtree that lies entirely above k.
+		auto bound = k;
+
+		while(true) {
+			// Descend along bound, looking for the first entry that is not below it.
+			while(n) {
+				if(pfx_of(bound, n->depth) != n->prefix) {
+					// n's range is entirely below bound: backtrack.
+					if(bound > n->prefix)
+						break;
+					// n's range is entirely above bound: descend to n's leftmost entry.
+					bound = n->prefix;
+				}
+
+				if(n->depth == ll) {
+					auto cn = static_cast<entry_node *>(n);
+					auto mask = cn->mask.load(std::memory_order_acquire);
+					for(unsigned int idx = idx_of(bound, ll); idx < 16; idx++) {
+						if(mask & (uint16_t(1) << idx))
+							return iterator{this, cn, idx};
+					}
+					// Erasure does not remove empty nodes, so this leaf can be exhausted.
+					break;
+				}
+
+				auto cn = static_cast<link_node *>(n);
+				auto idx = idx_of(bound, cn->depth);
+				FRG_ASSERT(height < ll);
+				path[height++] = {cn, idx};
+				n = cn->links[idx].load(std::memory_order_acquire);
+			}
+
+			// Backtrack to the deepest ancestor that has a sibling above the visited one.
+			n = nullptr;
+			while(height && !n) {
+				auto &top = path[height - 1];
+				for(unsigned int idx = top.idx + 1; idx < 16; idx++) {
+					auto m = top.node->links[idx].load(std::memory_order_acquire);
+					if(m) {
+						top.idx = idx;
+						n = m;
+						break;
+					}
+				}
+				if(!n)
+					height--;
+			}
+			if(!n)
+				return iterator{};
+
+			// The sibling's subtree lies entirely above bound.
+			bound = n->prefix;
+		}
 	}
 
 private:
