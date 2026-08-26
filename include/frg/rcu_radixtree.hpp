@@ -333,6 +333,11 @@ public:
 			return !(*this == other);
 		}
 
+		uint64_t key() const {
+			FRG_ASSERT(_idx < 16);
+			return _n->prefix | _idx;
+		}
+
 	private:
 		entry_node *_n;
 		unsigned int _idx;
@@ -356,6 +361,72 @@ public:
 
 	iterator end() {
 		return iterator{};
+	}
+
+	// Returns an iterator to the first entry with a key >= k, or end().
+	// Like find(), this is RCU-safe.
+	iterator lower_bound(uint64_t k) {
+		// Path of link nodes from the root, together with the index we descended into.
+		// Link nodes have depths in [0, ll) and depths increase strictly along a path,
+		// hence at most ll link nodes can occur.
+		struct { link_node *node; unsigned int idx; } path[ll];
+		unsigned int height = 0;
+
+		auto n = _root.load(std::memory_order_acquire);
+		// Lower bound that applies below the current node.
+		// Raised to a subtree's prefix whenever we enter a subtree that lies entirely above k.
+		auto bound = k;
+
+		while(true) {
+			// Descend along bound, looking for the first entry that is not below it.
+			while(n) {
+				if(pfx_of(bound, n->depth) != n->prefix) {
+					// n's range is entirely below bound: backtrack.
+					if(bound > n->prefix)
+						break;
+					// n's range is entirely above bound: descend to n's leftmost entry.
+					bound = n->prefix;
+				}
+
+				if(n->depth == ll) {
+					auto cn = static_cast<entry_node *>(n);
+					auto mask = cn->mask.load(std::memory_order_acquire);
+					for(unsigned int idx = idx_of(bound, ll); idx < 16; idx++) {
+						if(mask & (uint16_t(1) << idx))
+							return iterator{cn, idx};
+					}
+					// Erasure does not remove empty nodes, so this leaf can be exhausted.
+					break;
+				}
+
+				auto cn = static_cast<link_node *>(n);
+				auto idx = idx_of(bound, cn->depth);
+				FRG_ASSERT(height < ll);
+				path[height++] = {cn, idx};
+				n = cn->links[idx].load(std::memory_order_acquire);
+			}
+
+			// Backtrack to the deepest ancestor that has a sibling above the visited one.
+			n = nullptr;
+			while(height && !n) {
+				auto &top = path[height - 1];
+				for(unsigned int idx = top.idx + 1; idx < 16; idx++) {
+					auto m = top.node->links[idx].load(std::memory_order_acquire);
+					if(m) {
+						top.idx = idx;
+						n = m;
+						break;
+					}
+				}
+				if(!n)
+					height--;
+			}
+			if(!n)
+				return iterator{};
+
+			// The sibling's subtree lies entirely above bound.
+			bound = n->prefix;
+		}
 	}
 
 private:
