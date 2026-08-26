@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <concepts>
+#include <utility>
 
 #include <frg/allocation.hpp>
 #include <frg/macros.hpp>
@@ -69,6 +70,12 @@ struct intrusive_shared_ptr {
 
 	T *get() const {
 		return ptr_;
+	}
+
+	// Releases ownership of the reference held by this pointer.
+	// The caller now owns the reference (i.e., the refcount is not decremented).
+	T *release() {
+		return std::exchange(ptr_, nullptr);
 	}
 
 	T *operator->() const {
