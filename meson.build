@@ -32,6 +32,7 @@ if not get_option('frigg_no_install')
 		'include/frg/random.hpp',
 		'include/frg/rbtree.hpp',
 		'include/frg/rcu.hpp',
+		'include/frg/rcu_btree.hpp',
 		'include/frg/rcu_radixtree.hpp',
 		'include/frg/ringbuffer.hpp',
 		'include/frg/safe_int.hpp',
