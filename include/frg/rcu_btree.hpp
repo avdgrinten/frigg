@@ -518,6 +518,57 @@ private:
 	}
 
 	// ------------------------------------------------------------------------
+	// Invariant validation (must use external locking).
+	// ------------------------------------------------------------------------
+public:
+	// Returns: Whether the tree satisfies all structural invariants (see check_invariant_()).
+	bool check_invariant() {
+		auto root = root_.load(std::memory_order_relaxed);
+		if(!root)
+			return true;
+		if(root->parent)
+			return false;
+		int depth;
+		return check_invariant_(root, nullptr, nullptr, depth);
+	}
+
+private:
+	// Checks the subtree rooted at n: key order, key ranges, number of keys, parent pointers
+	// and uniform leaf depth. Keys must be >= *lower and < *upper (if non-null).
+	// On success, depth is set to the height of n.
+	bool check_invariant_(node *n, const K *lower, const K *upper, int &depth) {
+		// The root is exempt from min_keys but must not be empty.
+		if(n->num_keys < (n->parent ? min_keys : 1) || n->num_keys > nkeys)
+			return false;
+		for(int i = 0; i < n->num_keys; ++i) {
+			if(i > 0 && !(n->keys[i - 1] < n->keys[i]))
+				return false;
+			if((lower && n->keys[i] < *lower) || (upper && !(n->keys[i] < *upper)))
+				return false;
+		}
+		if(n->leaf) {
+			depth = 0;
+			return true;
+		}
+
+		// Children must point back to n and all leaves must be at the same depth.
+		auto inner = static_cast<inner_node *>(n);
+		for(int i = 0; i <= n->num_keys; ++i) {
+			auto child = child_(inner, i);
+			if(!child || child->parent != inner)
+				return false;
+			int child_depth;
+			if(!check_invariant_(child, i > 0 ? &n->keys[i - 1] : lower,
+					i < n->num_keys ? &n->keys[i] : upper, child_depth))
+				return false;
+			if(i > 0 && child_depth + 1 != depth)
+				return false;
+			depth = child_depth + 1;
+		}
+		return true;
+	}
+
+	// ------------------------------------------------------------------------
 	// Internal helpers for mutation.
 	//
 	// New nodes are built front to back: copy a range of an existing node, then append to it,
